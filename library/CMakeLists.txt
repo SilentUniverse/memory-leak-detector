@@ -106,6 +106,8 @@ find_library(
 # can link multiple libraries, such as libraries you define in this
 # build script, prebuilt third-party libraries, or system libraries.
 
+target_link_options(raphael PRIVATE -Wl,-z,max-page-size=16384)
+
 target_link_libraries(
         # Specifies the target library.
         raphael

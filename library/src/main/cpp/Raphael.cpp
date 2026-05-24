@@ -86,7 +86,7 @@ void Raphael::clean_cache(JNIEnv *env) {
             }
         }
         closedir(pDir);
-    } else if (mkdir(mSpace, 777) != 0) {
+    } else if (mkdir(mSpace, 0777) != 0) {
         LOGGER("create %s failed, please check permissions", mSpace);
     } else {
         LOGGER("create %s success", mSpace);
