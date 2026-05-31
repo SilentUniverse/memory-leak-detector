@@ -40,7 +40,7 @@ static constexpr char kDebugPropertyProgram[] = "libc.debug.malloc.program";
 
 `InitSharedLibrary()` 找 6 个 `$prefix_xxx` 符号 + 14 个 `$prefix_$dispatch` 符号（即 `debug_malloc / debug_free / ...`），把它们写进 `MallocDispatch` 替换表。
 
-**这意味着：你新写一个 `libc_malloc_owl.so`，只要它导出 `owl_initialize / owl_finalize / owl_malloc / owl_free / ...`，然后 `setprop libc.debug.malloc.options "<options>"` + 自己改 prefix 选择逻辑，bionic 就会加载它**。最小路径是：直接 fork malloc_debug 改 `kDebugPrefix` 与库名一处，不动加载逻辑。
+**结论：库名 `libc_malloc_debug.so`、prefix `debug`、导出符号 `debug_*`、两个 property 名（`libc.debug.malloc.options` / `libc.debug.malloc.program`）全部是 bionic 写死的接口。我们的 fork 必须照原样命名、原样导出，bionic 加载逻辑零改动，App 启用方式与官方 malloc_debug 完全一致**。
 
 ### 1.2 `MallocDispatch` 表里**没有 mmap**
 
@@ -121,22 +121,53 @@ z <0|1>  sz <size>  num <count>  bt <pc> <pc> ...
 
 ## 2. 总体设计
 
-### 2.1 库与 prefix 命名
+### 2.1 对外接口全部保留（库名 / prefix / 符号 / property 不变）
 
-| 原 | 新 |
+所有对 App、bionic、运维脚本可见的接口严格保留原值：
+
+| 项 | 取值（与官方完全一致） |
 |---|---|
-| `libc_malloc_debug.so` | `libc_malloc_owl.so` |
-| `debug_*` 符号 | `owl_*` 符号 |
-| `libc.debug.malloc.options=backtrace` | `libc.debug.malloc.options=owl,bt_fp,by_so` |
-| `kDebugPrefix = "debug"` | 复用 `kDebugPrefix`，因为我们就是替换 debug 槽 |
+| 库名 | `libc_malloc_debug.so` |
+| AOSP 模块名 | `libc_malloc_debug` |
+| prefix | `debug` |
+| 导出符号 | `debug_initialize / debug_malloc / debug_free / ...`（21 个，见 [exported64.map](reference/bionic/libc/malloc_debug/exported64.map)） |
+| 启用 property | `libc.debug.malloc.options` / `libc.debug.malloc.program` |
+| 触发 dump 信号 | `SIGRTMAX-17` (47) |
+| dump 文件路径 | `/data/local/tmp/backtrace_heap.<pid>.txt` |
 
-**实操选 A：直接替换 `libc_malloc_debug.so`**。AOSP 树里只改 `bionic/libc/malloc_debug/`，编出来推到 `/apex/com.android.runtime/lib64/bionic/libc_malloc_debug.so`。bionic 加载逻辑零改动。`debug_*` 符号名也保留——只要 ABI 兼容，原来的 `am dumpheap -n` 与 `dumpsys meminfo --unreachable` 都还能跑。这是改动最小的方案。
+好处：
+- App 侧启用方式 **0 变化**：原来怎么 `setprop libc.debug.malloc.options "backtrace"` 启用官方 malloc_debug，现在就怎么用，区别只是 option 字符串可以多写几个新关键字（`bt_fp` / `by_so` / `track_mmap` / `mmap_filter_ro`）。
+- `am dumpheap -n`、`dumpsys meminfo --unreachable`、官方 `aosp/development/scripts/native_heapdump_viewer.py` 等周边工具继续可用。
+- 回滚只需推回原版 so，配置不动。
 
-如果不想动 apex（需要重新签名），用 B 方案：
+**唯一动作：把改造后的 `bionic/libc/malloc_debug/` 编出 `libc_malloc_debug.so`，覆盖 `/apex/com.android.runtime/lib64/bionic/libc_malloc_debug.so`**。
 
-**实操选 B：另开 `libc_malloc_owl.so`** —— 改 [malloc_common_dynamic.cpp](reference/bionic/libc/bionic/malloc_common_dynamic.cpp) 加一段 `CheckLoadMallocOwl()`，并新增 `kOwlSharedLib / kOwlPrefix / kOwlPropertyOptions`。这要改 libc，影响面更大但能与原 debug 共存。
+### 2.1.1 启用流程（与官方 malloc_debug 完全等价）
 
-**推荐 A 方案**：单库替换，回滚只需推回原版。下文 §3-§6 以 A 方案展开。
+```bash
+# 一次性：推送改造版 so（覆盖原版）
+adb root && adb remount
+adb push out/.../libc_malloc_debug.so /apex/com.android.runtime/lib64/bionic/
+adb reboot
+
+# 启用（与官方 README 一致：https://android.googlesource.com/platform/bionic/+/master/libc/malloc_debug/README.md）
+adb shell setprop libc.debug.malloc.options \
+  "backtrace bt_fp by_so track_mmap mmap_filter_ro"
+adb shell setprop libc.debug.malloc.program com.example.targetapp
+adb shell stop && adb shell start
+
+# 触发 dump
+adb shell kill -47 $(pidof com.example.targetapp)
+adb pull /data/local/tmp/backtrace_heap.<pid>.txt artifacts/
+```
+
+**关键**：option 字符串中老的关键字（`backtrace` / `backtrace=N` / `fill` / `guard` / `free_track` / `record_allocs` / `verbose` 等）**全部继续生效**。我们只在 [Config.cpp](reference/bionic/libc/malloc_debug/Config.cpp) 的 `kOptions[]` 末尾**追加** 4 条新条目，没动任何已有条目（见 §2.2）。也就是说：
+- 想用官方原能力 → `setprop libc.debug.malloc.options "backtrace"`，行为与原版逐字节一致。
+- 想用新能力 → 在 option 串里加 `bt_fp by_so track_mmap` 等关键字即可。
+
+### 2.1.2 不采用：B 方案（另开 sibling 库）
+
+理论上可以加 `libc_malloc_owl.so` + `kOwlPrefix` + `libc.owl.options`，但要改 libc 自身，且 App 启用流程会与官方文档脱节，运维成本明显更高。**放弃**。
 
 ### 2.2 新增 option 位
 
@@ -153,20 +184,19 @@ option 字符串解析：在 [Config.cpp](reference/bionic/libc/malloc_debug/Con
 
 推荐组合：`backtrace bt_fp by_so track_mmap mmap_filter_ro backtrace_min_size=512`，对长跑大型 App 是平衡点。
 
-### 2.3 启用方式（Android 12 + root + FW 可改）
+### 2.3 启用方式补充：单 App 精确 attach
+
+基础流程已在 §2.1.1 给出。若想只对一个 release App 生效（不影响其它进程），两条路：
 
 ```bash
-adb root
-adb remount   # apex 那就 unzip 后 re-pack；最干净的是放进系统镜像
-adb push libc_malloc_debug.so /apex/com.android.runtime/lib64/bionic/
-adb shell stop && adb shell start
+# 路径 A：用官方 program 过滤（推荐，无 FW 改动）
+#   bionic 内部 strstr(getprogname(), program) 匹配才加载 libc_malloc_debug.so
+adb shell setprop libc.debug.malloc.options \
+  "backtrace bt_fp by_so track_mmap mmap_filter_ro"
+adb shell setprop libc.debug.malloc.program com.example.targetapp
+adb shell am force-stop com.example.targetapp
 
-# 任选一种 attach 方式：
-# 1) 直接全局 + program 过滤
-adb shell setprop libc.debug.malloc.options "backtrace bt_fp by_so track_mmap mmap_filter_ro"
-adb shell setprop libc.debug.malloc.program  com.example.targetapp
-
-# 2) 只对一个 App（注意：FW 要摘 debuggable 校验，见 §6.1）
+# 路径 B：wrap.<pkg> + LIBC_DEBUG_MALLOC_OPTIONS（FW 要摘 debuggable 校验，见 §6.1）
 adb shell setprop wrap.com.example.targetapp \
   '"LIBC_DEBUG_MALLOC_OPTIONS=backtrace bt_fp by_so track_mmap mmap_filter_ro logwrapper"'
 adb shell am force-stop com.example.targetapp
