@@ -11,7 +11,7 @@
 - 要把超阈值的 so 立刻指派到模块负责人。
 - 长跑不 ANR、开销可控。
 
-最终方案：**fork `libc_malloc_debug.so` 改名 `libc_malloc_owl.so`**（"owl"=on-the-fly per-so leak watcher，下文沿用此命名占位），加 4 件事：
+最终方案：**就地 fork `libc_malloc_debug.so`，库名 / prefix / 21 个 `debug_*` 符号 / 两个 property 全部不变**（详见 §2.1），只在内部加 4 件事：
 1. 加 `mmap/munmap/mremap` hook（malloc_debug 不抓 mmap，必须自己补）。
 2. 在 `PointerInfoType` 上加 `owner_so_id`，每次 `Add()` 时归属到一个业务 so。
 3. dump 时按 `owner_so_id` 分桶 → 按 retained bytes 排序输出 `SO_SUMMARY`。
@@ -167,7 +167,7 @@ adb pull /data/local/tmp/backtrace_heap.<pid>.txt artifacts/
 
 ### 2.1.2 不采用：B 方案（另开 sibling 库）
 
-理论上可以加 `libc_malloc_owl.so` + `kOwlPrefix` + `libc.owl.options`，但要改 libc 自身，且 App 启用流程会与官方文档脱节，运维成本明显更高。**放弃**。
+理论上可以加一个新的 sibling 库（如 `libc_malloc_ext.so`）+ 新 prefix + 新 property，但要改 libc 自身，且 App 启用流程会与官方文档脱节，运维成本明显更高。**放弃**。
 
 ### 2.2 新增 option 位
 
@@ -536,10 +536,10 @@ if ((runtime_flags & RuntimeFlags::DEBUG_ENABLE_JDWP) == 0) {
 }
 ```
 
-最简：加一个新 prop `persist.owl.wrap.allow_all`，置 1 时无条件允许 wrap。
+最简：加一个新 prop `persist.debug.malloc.wrap_all`，置 1 时无条件允许 wrap。
 
 ```cpp
-if (android::base::GetBoolProperty("persist.owl.wrap.allow_all", false)) {
+if (android::base::GetBoolProperty("persist.debug.malloc.wrap_all", false)) {
   // 跳过 debuggable 检查，照样读 wrap.<pkg>
 }
 ```
@@ -551,14 +551,14 @@ if (android::base::GetBoolProperty("persist.owl.wrap.allow_all", false)) {
 Android 12 上 `setprop libc.debug.malloc.options` 重启会丢。要长期跑，加进 `init.rc`：
 
 ```
-on property:persist.owl.target_program=*
+on property:persist.debug.malloc.target_program=*
     setprop libc.debug.malloc.options "backtrace bt_fp by_so track_mmap mmap_filter_ro"
-    setprop libc.debug.malloc.program  ${persist.owl.target_program}
+    setprop libc.debug.malloc.program  ${persist.debug.malloc.target_program}
 ```
 
-然后 `setprop persist.owl.target_program com.example.targetapp; stop; start`。
+然后 `setprop persist.debug.malloc.target_program com.example.targetapp; stop; start`。
 
-### 6.3 让 zygote 改 dispatch 时仍走 owl
+### 6.3 让 zygote 改 dispatch 时仍走我们的 fork
 
 `bionic/libc/bionic/malloc_common_dynamic.cpp::MallocInitImpl` 启动期检查 prop → dlopen libc_malloc_debug.so。**不需要改**，A 方案完美兼容。
 
