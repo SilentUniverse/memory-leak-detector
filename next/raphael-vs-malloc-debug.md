@@ -316,6 +316,118 @@ Raphael 要做"长跑大型 App 内存泄漏工具"，至少要补：
 
 ---
 
+## 7. 场景：Android 12 + root + 可改 FW + 无 App 源码
+
+这是一个**Raphael 不适用、malloc_debug 路线最划算**的典型场景。本节给出具体落地建议，纠正"零侵入 = 零消耗 + 自动按 so 排序"的常见误解。
+
+### 7.1 为什么 Raphael 在这个场景下出局
+
+Raphael 的所有路径都假设 App 内能调用 `Raphael.start(...)` 或装好接收广播的 `RaphaelReceiver`：
+- `library/src/main/java/com/bytedance/raphael/Raphael.java` 是 Java API，必须打进 APK；
+- `JNI_OnLoad → registerNatives → nStart/nStop/nPrint` 这条链需要 App 主动 `System.loadLibrary("raphael")`；
+- 即使你愿意走 反编译 → smali 注入 → 重打包 → 重签名，对非 debuggable 包还要在 FW 里关闭签名校验（`PackageManagerService` / `installd`），改动面比"改 malloc_debug"大得多，而且每次目标 App 升级都得重做。
+
+结论：**App 无源码 = Raphael 直接出局**。下面讨论的全是 malloc_debug 路线。
+
+### 7.2 启用方式（root + FW 可改时）
+
+按"侵入度从小到大"排：
+
+1. **`wrap.<pkg>` + FW 关掉 debuggable 校验**（最小改动）
+   ```
+   adb root
+   adb shell setprop wrap.com.example.app '"LIBC_DEBUG_MALLOC_OPTIONS=backtrace logwrapper"'
+   adb shell am force-stop com.example.app
+   ```
+   原版 zygote 在 `frameworks/base/core/java/com/android/internal/os/Zygote.java::specializeAppProcess` → native `SpecializeCommon` → `EnableDebugger` 路径会检查 `ApplicationInfo.flags & FLAG_DEBUGGABLE`，非 debuggable 包不会读 `wrap.*` 属性。**改 FW 把这层校验摘掉**（直接对所有包允许 wrap，或加一个新 prop `persist.debug.wrap.allow_all=1`），Android 12 对应文件大致是 `frameworks/base/core/jni/com_android_internal_os_Zygote.cpp` 里的 `MaybeInstallLinkerNamespace` / `EnableDebugger` 附近。
+2. **全局开 + program 过滤**（更稳，不依赖 wrap）
+   ```
+   adb shell setprop libc.debug.malloc.options backtrace
+   adb shell setprop libc.debug.malloc.program com.example.app
+   adb shell stop && adb shell start
+   ```
+   zygote 启动时 bionic 会在 `__libc_init_malloc` 里读这两个 prop，命中 `program` 的进程 fork 后 dlopen `libc_malloc_debug.so`。**这条路径 Android 12 上对 release 包同样生效**，无需 wrap。
+3. **改 zygote 强制 attach**（最稳）
+   在 `Zygote::specializeAppProcess` 里按 uid/pkg 白名单无条件设置 `__libc_globals.malloc_dispatch`，跳过 prop 链路。**适合长期接入而不是临时排查**。
+
+### 7.3 改 malloc_debug.so 必须做的四件事（按 ROI）
+
+参照源码 [bionic/libc/malloc_debug/](https://android.googlesource.com/platform/bionic/+/master/libc/malloc_debug/)：
+
+1. **加 mmap/munmap/mremap hook + interval tracker**（最高优）
+   - malloc_debug 默认**完全不碰 mmap**。Android 12 上 SoLoader、字体、resources.arsc、texture cache、各种 `MAP_ANONYMOUS` 自管池都走 mmap，**不补这块等于丢掉大头**。
+   - 实现方式：在 `malloc_debug.cpp` 的 `debug_initialize` 里追加 `xhook` 风格的 PLT/GOT 拦截，或者直接在 bionic 里把 `mmap/munmap/mremap` 也纳入 `MallocDispatch`。前者改动局限在 malloc_debug.so 内部；后者更彻底但要动 libc。
+   - 区间表用 `std::map<uintptr_t, MmapRange>` + 读写锁；语义参考 [next/optimization-and-automation-roadmap.md](next/optimization-and-automation-roadmap.md) §3.3。
+2. **把 unwinder 换成 FP 快路径 + DWARF 慢路径**
+   - 原版 `Backtrace::Unwind()` 走 libunwindstack，是 README 自述"慢一个数量级"的来源。
+   - 加 `bt_fast` 选项：arm64 直接拷过来 [library/src/main/unwind64/backtrace_64.cpp](library/src/main/unwind64/backtrace_64.cpp) 的 FP 链实现（80 行不到），单次抓栈降到 ~µs。
+   - 保留原 libunwindstack 作为 `backtrace_full` 模式：能穿 Java 帧的场景偶尔用。
+   - 这是改 malloc_debug 相对"原样启用"最大的性能收益点。
+3. **加 per-so 归属字段 + dump 时按 so 分桶排序**
+   - 在 `BacktraceData`（或 `PointerInfoType`）里加一个 `uint32_t owner_so_id`。
+   - `RecordBacktrace` 拿到栈后，从 `frames[0]` 起跳过 `libc_malloc_debug.so` 自身和 `libc.so/libm.so`，找到第一个业务 so，调 `dl_iterate_phdr` 或缓存 `xdl_addr` 拿到 `dli_fname` 做 hash → `owner_so_id`。
+   - `PointerData::DumpLiveToFile` 改为先按 `owner_so_id` group-by，再按该组 retained bytes 降序输出。Dump 头部加一段 `SO_SUMMARY` 段：
+     ```
+     SO_SUMMARY
+     libfoo.so   retained=128MB  alloc_count=12345
+     libbar.so   retained= 64MB  alloc_count= 6789
+     ...
+     END_SO_SUMMARY
+     ```
+   - 这是用户"立刻拿到 so 排序"诉求的最小改动实现，~200 行代码内可搞定。
+4. **强制 dump build-id**
+   - 原版 v1.2 已经写 `Build fingerprint`，但没写各 so 的 build-id。补一段从 `/proc/self/maps` 读取 + 解析 `.note.gnu.build-id` 的逻辑，落进 dump。
+   - 离线 `llvm-symbolizer` 严格对账，避免 owner 派单时栈是错的。
+
+可选第五件：**复用 `record_allocs` 模式做时间序列**——这是 Raphael 完全没有的能力，原样能用，不用改。
+
+### 7.4 比 fork malloc_debug 更轻的替代：自己写 `libc_malloc_<name>.so`
+
+bionic 的 `MallocDispatch` 是公开抽象（`bionic/libc/private/bionic_malloc_dispatch.h`），jemalloc / scudo / hwasan / malloc_debug **都是同级的 dispatch 实现**。你完全可以：
+
+1. 新建 `libc_malloc_raphaeld.so`，实现一组 `raphaeld_malloc / raphaeld_free / ...`，导出 `__libc_globals` 替换函数。
+2. 加载方式复用 `libc.debug.malloc.options` 同一套链路：bionic 会 `dlopen("libc_malloc_$OPTION.so")`，所以 `setprop libc.debug.malloc.options raphaeld` 即可在目标进程激活，**不需要改 libc 任何代码**。
+3. 内部直接用 Raphael 的 `MemoryCache` + `AllocPool` + FP unwind + per-so 归属，加上 mmap hook。
+
+好处：
+- 不被 malloc_debug 的 guard / fill / free_track 等复杂逻辑拖累，二进制更小，启动更快；
+- 不用合并 bionic 上游变更——每个 Android 版本只关心 `MallocDispatch` 表结构是否动了（很少动）；
+- 接口语义对 zygote 透明，**任何 root 设备都能 setprop 启用**，行为上等价于 malloc_debug，但开销和 Raphael 同级。
+
+成本：
+- 要自己处理 `MallocDispatch` 的所有字段（约 12 个函数指针），不能漏一个；
+- `mallinfo / malloc_info / mallopt` 这些次要接口要 forward 给真实 allocator（jemalloc/scudo），不能自己实现。
+
+**这条路线是"Android 12 + root + 无 App 源码 + 想要 Raphael 级别低开销 + 自动按 so 排序"四个约束同时满足的最优解。** 工作量大概是 1-2 周一个人，比 fork 整个 malloc_debug 小，比改 App 集成 Raphael 风险低。
+
+### 7.5 对照速查
+
+| 维度 | 原样启用 malloc_debug | 改 malloc_debug.so（§7.3） | 自己写 `libc_malloc_*.so`（§7.4） | 强行集成 Raphael |
+|---|---|---|---|---|
+| 需要 App 源码 | 否 | 否 | 否 | **是**（或反编译重打包） |
+| 启用门槛 | root + wrap.sh/prop | root + FW 改 wrap 校验 | root + setprop | App 改造 + 重打包 + 重签名 |
+| 单次 alloc 开销 | ~10× FP unwind | FP 模式 ≈ Raphael | ≈ Raphael | Raphael 基线 |
+| hook mmap | 否 | **是**（手加） | **是**（手加） | 是 |
+| 按 so 自动排序 | 否（要离线写） | **是**（dump 头加 SO_SUMMARY） | **是** | per-so 改造后是 |
+| free 栈 / 时间序列 | `free_track` / `record_allocs` 自带 | 同左，保留 | 需自己加 | 完全没有，要全新实现 |
+| UAF / 堆破坏 | guard/fill/verify | 保留 | 不做（除非你加） | 没有 |
+| Android 版本升级维护 | 跟 bionic 走 | 每个版本 merge upstream | 每个版本看 dispatch 表是否变 | 跟 Raphael 走 |
+| 适合长期接入 | 否（开销太大） | 是 | **最佳** | 否（要持续覆盖目标 App） |
+
+### 7.6 落地建议
+
+如果立刻想出结果：**先用 §7.2 第 2 条（`libc.debug.malloc.options=backtrace_min_size=4096 backtrace`）跑一次原版 malloc_debug**，确认链路通、能拿到 dump、能离线符号化。这一步 0 代码，1 小时内完成。
+
+然后按 §7.4 起一个 `libc_malloc_raphaeld.so` 项目，第一版只做：
+1. 接住 `MallocDispatch` 12 个函数指针；
+2. 复用 Raphael 的 `MemoryCache` + arm64 FP unwind；
+3. 加 mmap/munmap/mremap hook；
+4. 落 dump 时按 `owner_so_id` 排序。
+
+第二版再补 `record_allocs` 风格的事件流（roadmap §5 借鉴清单）和 owners.yaml 派单（roadmap §3.13）。
+
+---
+
 ## 附：本文引用的源码定位
 
 - HOOK 入口 / 栈采集：[library/src/main/cpp/HookProxy.h](library/src/main/cpp/HookProxy.h)
